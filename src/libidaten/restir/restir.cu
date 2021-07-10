@@ -62,6 +62,12 @@ __global__ void shade(
 
     idx = hitindices[idx];
 
+    // Deactive shadow ray.
+    shadowRays[idx].isActive = false;
+
+    // Deactive reservoir.
+    reservoirs[idx].light_idx = -1;
+
     __shared__ idaten::ShadowRay shShadowRays[64];
     __shared__ aten::MaterialParameter shMtrls[64];
     __shared__ idaten::ReSTIRIntermedidate shIntermediates[64];
@@ -381,6 +387,191 @@ __global__ void hitShadowRay(
     }
 }
 
+__host__ __device__ void OnComputeSpatialReuse(
+    int idx,
+    aten::sampler* sampler,
+    const idaten::Reservoir* reservoirs,
+    idaten::Reservoir* dst_reservoirs,
+    const idaten::ReSTIRIntermedidate* intermediates,
+    idaten::ReSTIRIntermedidate* dst_intermediates,
+    int width, int height)
+{
+    int ix = idx % width;
+    int iy = idx / width;
+
+    static const int pos_x[] = {
+        -1,
+         0,
+         1,
+
+        -1,
+         1,
+
+        -1,
+         0,
+         1,
+    };
+
+    static const int pos_y[] = {
+        -1,
+        -1,
+        -1,
+
+         0,
+         0,
+
+         1,
+         1,
+         1,
+    };
+
+    int reuse_idx = -1;
+    auto new_reservoir = reservoirs[idx];
+
+#pragma unroll
+    for (int i = 0; i < AT_COUNTOF(pos_x); i++) {
+        const auto p_x = pos_x[i];
+        const auto p_y = pos_y[i];
+
+        int x = aten::clamp<decltype(x)>(ix + p_x, 0, width - 1);
+        int y = aten::clamp<decltype(y)>(iy + p_y, 0, height - 1);
+
+        auto new_idx = getIdx(x, y, width);
+        const auto& reservoir = reservoirs[new_idx];
+
+        new_reservoir.w += reservoir.w;
+        new_reservoir.m += reservoir.m;
+
+#if 1
+        if (new_reservoir.w > 0.0f) {
+            auto r = sampler->nextSample();
+            if (r <= reservoir.w / new_reservoir.w) {
+                new_reservoir.light_pdf = reservoir.light_pdf;
+                new_reservoir.light_idx = reservoir.light_idx;
+                reuse_idx = new_idx;
+            }
+        }
+#endif
+    }
+
+#if 1
+    if (reuse_idx >= 0) {
+        dst_reservoirs[idx] = new_reservoir;
+
+        dst_intermediates[idx].light_sample_nml = intermediates[reuse_idx].light_sample_nml;
+        dst_intermediates[idx].light_color = intermediates[reuse_idx].light_color;
+    }
+    else {
+        dst_reservoirs[idx] = reservoirs[idx];
+        dst_intermediates[idx] = intermediates[idx];
+    }
+#endif
+}
+
+__global__ void computeSpatialReuse(
+    idaten::Path* paths,
+    const idaten::Reservoir* __restrict__ reservoirs,
+    idaten::Reservoir* dst_reservoirs,
+    const idaten::ReSTIRIntermedidate* __restrict__ intermediates,
+    idaten::ReSTIRIntermedidate* dst_intermediates,
+    int width, int height,
+    int* hitindices,
+    int* hitnum)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= *hitnum) {
+        return;
+    }
+
+    idx = hitindices[idx];
+
+#if 1
+    OnComputeSpatialReuse(
+        idx,
+        &paths->sampler[idx],
+        reservoirs,
+        dst_reservoirs,
+        intermediates,
+        dst_intermediates,
+        width, height
+    );
+#else
+    int ix = idx % width;
+    int iy = idx / width;
+
+    static const int pos_x[] = {
+        -1,
+         0,
+         1,
+
+        -1,
+         1,
+
+        -1,
+         0,
+         1,
+    };
+
+    static const int pos_y[] = {
+        -1,
+        -1,
+        -1,
+
+         0,
+         0,
+
+         1,
+         1,
+         1,
+    };
+
+    auto& sampler = paths->sampler[idx];
+
+    int reuse_idx = -1;
+    auto new_reservoir = reservoirs[idx];
+
+#pragma unroll
+    for (int i = 0; i < AT_COUNTOF(pos_x); i++) {
+        const auto p_x = pos_x[i];
+        const auto p_y = pos_y[i];
+
+        int x = aten::clamp<decltype(x)>(ix + p_x, 0, width - 1);
+        int y = aten::clamp<decltype(y)>(iy + p_y, 0, height - 1);
+
+        auto new_idx = getIdx(x, y, width);
+        const auto& reservoir = reservoirs[new_idx];
+
+        new_reservoir.w += reservoir.w;
+        new_reservoir.m += reservoir.m;
+
+#if 0
+        if (new_reservoir.w > 0.0f) {
+            auto r = sampler->nextSample();
+            if (r <= reservoir.w / new_reservoir.w) {
+                new_reservoir.light_pdf = reservoir.light_pdf;
+                new_reservoir.light_idx = reservoir.light_idx;
+                reuse_idx = new_idx;
+            }
+        }
+#endif
+    }
+
+#if 1
+    if (reuse_idx >= 0) {
+        dst_reservoirs[idx] = new_reservoir;
+
+        dst_intermediates[idx].light_sample_nml = intermediates[reuse_idx].light_sample_nml;
+        dst_intermediates[idx].light_color = intermediates[reuse_idx].light_color;
+    }
+    else {
+        dst_reservoirs[idx] = reservoirs[idx];
+        dst_intermediates[idx] = intermediates[idx];
+    }
+#endif
+#endif
+}
+
 __global__ void computeShadowRayContribution(
     const idaten::Reservoir* __restrict__ reservoirs,
     const idaten::ReSTIRIntermedidate* __restrict__ intermediates,
@@ -559,8 +750,8 @@ namespace idaten
 
         shade << <blockPerGrid, threadPerBlock, 0, m_stream >> > (
             m_tileDomain,
-            m_reservoirs.ptr(),
-            m_intermediates.ptr(),
+            m_reservoirs[0].ptr(),
+            m_intermediates[0].ptr(),
             m_aovNormalDepth.ptr(),
             m_aovTexclrMeshid.ptr(),
             mtxW2C,
@@ -584,10 +775,13 @@ namespace idaten
 
         checkCudaKernel(shade);
 
-        onShadeByShadowRayReSTIR(bounce, texVtxPos);
+        onShadeByShadowRayReSTIR(
+            width, height,
+            bounce, texVtxPos);
     }
 
     void ReSTIRPathTracing::onShadeByShadowRayReSTIR(
+        int width, int height,
         int bounce,
         cudaTextureObject_t texVtxPos)
     {
@@ -600,7 +794,7 @@ namespace idaten
             bounce,
             m_paths.ptr(),
             m_hitidx.ptr(), hitcount.ptr(),
-            m_reservoirs.ptr(),
+            m_reservoirs[0].ptr(),
             m_shadowRays.ptr(),
             m_shapeparam.ptr(), m_shapeparam.num(),
             m_mtrlparam.ptr(),
@@ -612,9 +806,75 @@ namespace idaten
 
         checkCudaKernel(hitShadowRay);
 
+        int target_idx = 0;
+
+#if 1
+        std::vector<std::remove_reference_t<decltype(m_reservoirs[0])>::type> reservoirs;
+        m_reservoirs[0].readFromDeviceToHost(reservoirs);
+
+        int num = 0;
+        for (const auto r : reservoirs) {
+            if (r.light_idx >= 0) {
+                num++;
+            }
+        }
+
+        std::vector<std::remove_reference_t<decltype(m_intermediates[0])>::type> intermediates;
+        m_intermediates[0].readFromDeviceToHost(intermediates);
+
+        std::vector<std::remove_reference_t<decltype(m_pathSampler)>::type> sampler;
+        m_pathSampler.readFromDeviceToHost(sampler);
+
+        std::vector<int> hitindices;
+        m_hitidx.readFromDeviceToHost(hitindices);
+
+        std::vector<int> cnt;
+        hitcount.readFromDeviceToHost(cnt);
+
+        std::vector<std::remove_reference_t<decltype(m_reservoirs[0])>::type> dst_reservoirs(reservoirs.size());
+        std::vector<std::remove_reference_t<decltype(m_intermediates[0])>::type> dst_intermediates(intermediates.size());
+
+        for (int i = 0; i < cnt[0]; i++) {
+            auto idx = hitindices[i];
+            if (reservoirs[i].light_idx >= 0 && reservoirs[i].light_idx != 125) {
+                int xx = 0;
+            }
+            OnComputeSpatialReuse(
+                idx,
+                sampler.data(),
+                reservoirs.data(), dst_reservoirs.data(),
+                intermediates.data(), dst_intermediates.data(),
+                width, height);
+        }
+
+        int new_num = 0;
+        for (const auto r : dst_reservoirs) {
+            if (r.light_idx >= 0) {
+                new_num++;
+            }
+        }
+#endif
+
+#if 1
+        if (bounce == 0) {
+            computeSpatialReuse << <blockPerGrid, threadPerBlock, 0, m_stream >> > (
+                m_paths.ptr(),
+                m_reservoirs[0].ptr(),
+                m_reservoirs[1].ptr(),
+                m_intermediates[0].ptr(),
+                m_intermediates[1].ptr(),
+                width, height,
+                m_hitidx.ptr(), hitcount.ptr());
+
+            checkCudaKernel(computeSpatialReuse);
+
+            target_idx = 1;
+        }
+#endif
+
         computeShadowRayContribution << <blockPerGrid, threadPerBlock, 0, m_stream >> > (
-            m_reservoirs.ptr(),
-            m_intermediates.ptr(),
+            m_reservoirs[target_idx].ptr(),
+            m_intermediates[target_idx].ptr(),
             m_paths.ptr(),
             m_hitidx.ptr(), hitcount.ptr(),
             m_aovNormalDepth.ptr(),

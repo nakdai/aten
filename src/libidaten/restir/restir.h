@@ -201,6 +201,7 @@ namespace idaten
             cudaTextureObject_t texVtxPos);
 
         void onShadeByShadowRayReSTIR(
+            int width, int height,
             int bounce,
             cudaTextureObject_t texVtxPos);
 
@@ -245,8 +246,8 @@ namespace idaten
         idaten::TypedCudaMemory<unsigned int> m_sobolMatrices;
         idaten::TypedCudaMemory<unsigned int> m_random;
 
-        idaten::TypedCudaMemory<ReSTIRIntermedidate>  m_intermediates;
-        idaten::TypedCudaMemory<Reservoir> m_reservoirs;
+        idaten::TypedCudaMemory<ReSTIRIntermedidate>  m_intermediates[2];
+        idaten::TypedCudaMemory<Reservoir> m_reservoirs[2];
 
         // Current AOV buffer position.
         int m_curAOVPos{ 0 };
